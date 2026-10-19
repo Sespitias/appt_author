@@ -55,7 +55,7 @@ Sheet **"Tebra Users"**, pestaña `users`, encabezados en la fila 1:
 ```bash
 # 1. Tablas y vistas (una vez)
 bq query --use_legacy_sql=false < sql/01_tables.sql
-SHEET_URL='https://docs.google.com/spreadsheets/d/<ID>' envsubst < sql/02_users_external.sql | bq query --use_legacy_sql=false
+sed 's|${SHEET_URL}|https://docs.google.com/spreadsheets/d/10tGKwQq1u7fKJcVStjdFdKdEcCGCQCb1a4B2BM6j9a8|' sql/02_users_external.sql | bq query --use_legacy_sql=false
 bq query --use_legacy_sql=false < sql/03_views.sql
 
 # 2. Job + scheduler (*/15)
