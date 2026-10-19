@@ -35,13 +35,20 @@ retry() {
   done
   "$@"  # last try, showing the error
 }
+echo "==> BigQuery job user on project"
 retry gcloud projects add-iam-policy-binding "$PROJECT" --member "serviceAccount:$SA" --role roles/bigquery.jobUser --condition=None
-retry bq add-iam-policy-binding --member="serviceAccount:$SA" --role=roles/bigquery.dataEditor "${PROJECT}:Telemind_BD"
+echo "==> BigQuery data editor on dataset Telemind_BD"
+# --headless: never stop at bq's first-run "pick a default project" prompt.
+retry bq --headless --project_id="$PROJECT" query --use_legacy_sql=false \
+  "GRANT \`roles/bigquery.dataEditor\` ON SCHEMA \`${PROJECT}.Telemind_BD\` TO 'serviceAccount:${SA}'"
+echo "==> Secret access"
 for s in "$SECRET_CUSTOMER_KEY" "$SECRET_USER" "$SECRET_PASSWORD"; do
   retry gcloud secrets add-iam-policy-binding "$s" --member "serviceAccount:$SA" --role roles/secretmanager.secretAccessor
 done
+echo "==> Building image (2-4 min)"
 
 gcloud builds submit --tag "$IMAGE" .
+echo "==> Deploying Cloud Run job"
 
 gcloud run jobs deploy "$JOB" \
   --image "$IMAGE" --region "$REGION" --service-account "$SA" \
@@ -50,6 +57,7 @@ gcloud run jobs deploy "$JOB" \
   --set-secrets "TEBRA_CUSTOMER_KEY=${SECRET_CUSTOMER_KEY}:latest,TEBRA_USER=${SECRET_USER}:latest,TEBRA_PASSWORD=${SECRET_PASSWORD}:latest"
 
 # Scheduler → run the job every 15 minutes.
+echo "==> Scheduler (every 15 min)"
 gcloud run jobs add-iam-policy-binding "$JOB" --region "$REGION" --member "serviceAccount:$SA" --role roles/run.invoker >/dev/null
 URI="https://run.googleapis.com/v2/projects/${PROJECT}/locations/${REGION}/jobs/${JOB}:run"
 if gcloud scheduler jobs describe "${JOB}-15m" --location "$REGION" >/dev/null 2>&1; then
