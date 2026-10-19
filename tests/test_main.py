@@ -78,10 +78,10 @@ def test_rows_carry_prod_last_modified(fake_bq):
 
 
 def test_partial_progress_saved_on_tebra_failure(fake_bq):
-    fake_bq["pending"] = [(str(i), PROD_TS) for i in range(10)]
+    fake_bq["pending"] = [(str(i), PROD_TS) for i in range(20)]
 
-    def flaky(i):
-        if i == "6":
+    def flaky(i):  # Tebra goes down from the 7th appointment on
+        if int(i) >= 6:
             raise ConnectionError("network down")
         return _ok(i)
 
@@ -103,7 +103,7 @@ def test_auth_error_fails_fast_without_writes(fake_bq):
 
 def test_stops_by_deadline_and_reports_it(fake_bq):
     fake_bq["pending"] = [(str(i), PROD_TS) for i in range(100)]
-    result = _run(fc=FakeClock(step=1.0), max_seconds=20)
+    result = _run(fc=FakeClock(step=1.0), max_seconds=20, flush_reserve=0)
     assert 0 < result["processed"] < 100
     assert result["stopped_by"] == "deadline"
     assert result["pending_after"] == 100 - result["processed"]
@@ -144,3 +144,47 @@ def test_staging_dropped_even_when_run_fails(fake_bq):
     with pytest.raises(TebraAuthError):
         _run(client=c, call=lambda i: (_ for _ in ()).throw(TebraAuthError("bad")))
     assert len(c.deleted) == 1
+
+
+def test_fetching_leaves_time_for_final_flush(fake_bq):
+    fake_bq["pending"] = [(str(i), PROD_TS) for i in range(1000)]
+    result = _run(fc=FakeClock(step=1.0), max_seconds=100, flush_reserve=60)
+    assert result["processed"] <= 40
+
+
+def test_stopped_by_done_only_when_nothing_pending(fake_bq):
+    fake_bq["pending"] = [(str(i), PROD_TS) for i in range(10)]
+    result = _run(limit=4)
+    assert result["processed"] == 4 and result["stopped_by"] == "limit" and result["pending_after"] == 6
+
+
+def test_recurring_occurrence_is_fetched_by_series_id(fake_bq):
+    fake_bq["pending"] = [("163379KKF", PROD_TS)]
+    asked = []
+    _run(call=lambda i: asked.append(i) or _ok(i))
+    assert asked == ["163379"]
+    assert fake_bq["loads"][0][0].id == "163379KKF"
+
+
+def test_unusable_id_recorded_as_fetch_error_without_calling_tebra(fake_bq):
+    fake_bq["pending"] = [("KKF", PROD_TS)]
+    asked = []
+    result = _run(call=lambda i: asked.append(i) or _ok(i))
+    assert asked == [] and result["fetch_errors"] == 1
+
+
+def test_null_author_guard_ignores_online_bookings(fake_bq):
+    fake_bq["pending"] = [(str(i), PROD_TS) for i in range(25)]
+    result = _run(call=lambda i: AppointmentAuthor(i, None, None, None, None, True, False))
+    assert result["processed"] == 25
+
+
+def test_dockerfile_cmd_is_accepted_by_cli():
+    import json
+    import re
+    from pathlib import Path
+
+    docker = (Path(__file__).parents[1] / "Dockerfile").read_text()
+    m = re.search(r"^CMD (\[.*\])", docker, re.M)
+    args = json.loads(m.group(1)) if m else []
+    main.build_parser().parse_args(args)  # SystemExit (exit 2) would fail the test

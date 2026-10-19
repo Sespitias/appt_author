@@ -12,9 +12,14 @@ from .models import AppointmentAuthor
 log = logging.getLogger(__name__)
 
 NULL_USER_IDS = {"", "0"}
-TRANSIENT_MESSAGE = re.compile(r"throttl|too many|rate limit|timeout|temporarily|unavailable", re.I)
+# Errors that are about this appointment and won't go away by retrying. Anything else Tebra reports is
+# treated as transient, so an outage never marks thousands of appointments as permanently failed.
+PERMANENT_MESSAGE = re.compile(r"does not exist|not found|deleted|not authorized|permission", re.I)
 RETRIES = 3
 BACKOFF_SECONDS = 2.0
+# This many appointments in a row failing after retries means Tebra is down: stop the run.
+MAX_CONSECUTIVE_FAILURES = 5
+SERIES_ID = re.compile(r"^(\d+)")
 
 
 class TebraError(RuntimeError):
@@ -27,6 +32,19 @@ class TebraAuthError(TebraError):
 
 class TebraTransientError(TebraError):
     """Throttling or a temporary failure: worth retrying."""
+
+
+RETRYABLE = (TebraTransientError, OSError, ET.ParseError)  # OSError covers requests/zeep transport errors
+
+
+def tebra_appointment_id(prod_id: str) -> str | None:
+    """Tebra ID to ask for. Recurring occurrences appear in prod as <series id><suffix> (e.g. 163379KKF)."""
+    match = SERIES_ID.match(prod_id or "")
+    return match.group(1) if match else None
+
+
+def _failed(appointment_id: str, error: str) -> AppointmentAuthor:
+    return AppointmentAuthor(appointment_id, None, None, None, None, None, None, fetch_error=error[:500])
 
 
 def _local(tag: str) -> str:
@@ -69,12 +87,14 @@ def parse_get_appointment(xml: bytes, appointment_id: str) -> AppointmentAuthor:
 
     error, security = _find(result, "ErrorResponse"), _find(result, "SecurityResponse")
     message = _child_text(error, "ErrorMessage") or "Tebra returned IsError=true"
-    if any(_child_text(security, f) == "false" for f in ("Authenticated", "Authorized", "CustomerKeyValid")):
+    if any(_child_text(security, f) == "false" for f in ("Authenticated", "CustomerKeyValid")):
         raise TebraAuthError(message)
+    if _child_text(security, "Authorized") == "false":  # this appointment's practice, not the whole account
+        return _failed(appointment_id, f"Not authorized: {message}")
     if _child_text(error, "IsError") == "true":
-        if TRANSIENT_MESSAGE.search(message):
-            raise TebraTransientError(message)
-        return AppointmentAuthor(appointment_id, None, None, None, None, None, None, fetch_error=message[:500])
+        if PERMANENT_MESSAGE.search(message):
+            return _failed(appointment_id, message)
+        raise TebraTransientError(message)
 
     appt = _find(result, "Appointment")
     return AppointmentAuthor(
@@ -97,7 +117,7 @@ class TebraClient:
         if not (self.s.tebra_customer_key and self.s.tebra_user and self.s.tebra_password):
             raise TebraAuthError("Set TEBRA_CUSTOMER_KEY, TEBRA_USER and TEBRA_PASSWORD")
         # Bounded waits: a hung call must fail well before the next 15-min run starts.
-        self.client = Client(self.s.tebra_wsdl, transport=Transport(timeout=60, operation_timeout=300))
+        self.client = Client(self.s.tebra_wsdl, transport=Transport(timeout=60, operation_timeout=30))
 
     def get_appointment(self, appointment_id: str) -> bytes:
         request = {
@@ -130,13 +150,18 @@ def fetch_authors(
 ) -> Iterator[AppointmentAuthor]:
     """Yield one AppointmentAuthor per ID, throttled, until `deadline` (a `clock()` value).
 
-    Transient errors are retried RETRIES times with exponential backoff; after that (or on an
-    auth error) the exception propagates, after everything fetched so far has been yielded.
+    - Transient errors are retried RETRIES times with exponential backoff (never past the deadline).
+      If an ID still fails it is skipped (it stays pending for the next run); after
+      MAX_CONSECUTIVE_FAILURES skipped IDs in a row the last error propagates (Tebra is down).
+    - Any other exception is specific to that appointment: it is yielded as a fetch_error row.
+    - TebraAuthError propagates at once.
     """
     last_call = None
+    consecutive_failures = 0
     for appointment_id in ids:
         if clock() >= deadline:
             return
+        result, last_error = None, None
         for attempt in range(RETRIES):
             if last_call is not None:
                 wait = last_call + min_interval - clock()
@@ -148,9 +173,21 @@ def fetch_authors(
                 break
             except TebraAuthError:
                 raise
-            except Exception as exc:
-                if attempt == RETRIES - 1:
-                    raise
+            except RETRYABLE as exc:
+                last_error = exc
+                pause = BACKOFF_SECONDS * 2 ** attempt
+                if attempt == RETRIES - 1 or clock() + pause >= deadline:
+                    break
                 log.warning("GetAppointment %s failed (%s); retry %d", appointment_id, exc, attempt + 1)
-                sleep(BACKOFF_SECONDS * 2 ** attempt)
+                sleep(pause)
+            except Exception as exc:
+                result = _failed(appointment_id, f"{type(exc).__name__}: {exc}")
+                break
+        if result is None:
+            consecutive_failures += 1
+            log.warning("GetAppointment %s skipped after retries: %s", appointment_id, last_error)
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                raise last_error
+            continue
+        consecutive_failures = 0
         yield result

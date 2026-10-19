@@ -36,7 +36,7 @@ gcloud builds submit --tag "$IMAGE" .
 
 gcloud run jobs deploy "$JOB" \
   --image "$IMAGE" --region "$REGION" --service-account "$SA" \
-  --task-timeout 900 --max-retries 0 --parallelism 1 --tasks 1 \
+  --task-timeout 840 --max-retries 0 --parallelism 1 --tasks 1 \
   --set-env-vars "$ENV_VARS" \
   --set-secrets "TEBRA_CUSTOMER_KEY=${SECRET_CUSTOMER_KEY}:latest,TEBRA_USER=${SECRET_USER}:latest,TEBRA_PASSWORD=${SECRET_PASSWORD}:latest"
 
@@ -47,7 +47,8 @@ if gcloud scheduler jobs describe "${JOB}-15m" --location "$REGION" >/dev/null 2
   gcloud scheduler jobs update http "${JOB}-15m" --location "$REGION" --schedule "*/15 * * * *" --uri "$URI" \
     --http-method POST --oauth-service-account-email "$SA"
 else
-  # Runs every 15 min; each run works at most MAX_RUN_SECONDS, so runs never overlap.
+  # Runs every 15 min. Scheduler does not wait for the previous execution: what prevents overlap is
+  # MAX_RUN_SECONDS (720 s, incl. a 60 s flush reserve) plus the 840 s task timeout, both under 15 min.
   # The historical backlog drains automatically, newest appointments first.
   gcloud scheduler jobs create http "${JOB}-15m" --location "$REGION" --schedule "*/15 * * * *" --uri "$URI" \
     --http-method POST --oauth-service-account-email "$SA"

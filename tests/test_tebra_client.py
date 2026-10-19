@@ -5,10 +5,12 @@ import pytest
 
 from appt_authors.models import AppointmentAuthor
 from appt_authors.tebra_client import (
+    MAX_CONSECUTIVE_FAILURES,
     TebraAuthError,
     TebraTransientError,
     fetch_authors,
     parse_get_appointment,
+    tebra_appointment_id,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -112,22 +114,6 @@ def test_retries_transient_then_succeeds():
     assert [a.id for a in out] == ["7"] and len(attempts) == 3
 
 
-def test_gives_up_after_3_transient_errors_without_losing_previous():
-    fc = FakeClock()
-    got = []
-
-    def fail_on_b(i):
-        if i == "b":
-            raise ConnectionError("network down")
-        return _author(i)
-
-    with pytest.raises(ConnectionError):
-        for a in fetch_authors(["a", "b", "c"], call=fail_on_b, deadline=1000, min_interval=0,
-                               sleep=fc.sleep, clock=fc.clock):
-            got.append(a.id)
-    assert got == ["a"]
-
-
 def test_auth_error_not_retried():
     calls = []
 
@@ -156,4 +142,79 @@ def test_client_sets_soap_timeouts(monkeypatch):
     s = Settings(tebra_customer_key="k", tebra_user="u", tebra_password="p")
     tebra_client.TebraClient(s)
     t = captured["transport"]
-    assert t is not None and t.operation_timeout == 300 and t.load_timeout == 60
+    assert t is not None and t.operation_timeout == 30 and t.load_timeout == 60
+
+
+# --- Review fixes -------------------------------------------------------------------------
+
+def _error_xml(message, authenticated="true", authorized="true"):
+    return (_fx("bad_auth").replace(b"Invalid user name and/or password", message.encode())
+            .replace(b"<Authenticated>false</Authenticated>", f"<Authenticated>{authenticated}</Authenticated>".encode())
+            .replace(b"<Authorized>false</Authorized>", f"<Authorized>{authorized}</Authorized>".encode()))
+
+
+def test_per_record_unauthorized_is_fetch_error():
+    a = parse_get_appointment(_error_xml("Not authorized for practice", authorized="false"), "5")
+    assert a.fetch_error and "authorized" in a.fetch_error.lower()
+
+
+def test_unknown_iserror_is_transient():
+    with pytest.raises(TebraTransientError):
+        parse_get_appointment(_error_xml("java.lang.NullPointerException at ..."), "5")
+
+
+def test_recurring_occurrence_ids_map_to_series():
+    assert tebra_appointment_id("163379KKF") == "163379"
+    assert tebra_appointment_id("251242") == "251242"
+    assert tebra_appointment_id("KKF") is None
+
+
+def test_persistent_transient_failure_skips_id_and_continues():
+    fc = FakeClock()
+
+    def fail_b(i):
+        if i == "b":
+            raise TebraTransientError("503")
+        return _author(i)
+
+    out = list(fetch_authors(["a", "b", "c"], call=fail_b, deadline=1000, min_interval=0,
+                             sleep=fc.sleep, clock=fc.clock))
+    assert [a.id for a in out] == ["a", "c"]  # b stays pending for the next run
+
+
+def test_aborts_after_consecutive_failures():
+    fc = FakeClock()
+    calls = []
+
+    def down(i):
+        calls.append(i)
+        raise ConnectionError("network down")
+
+    with pytest.raises(ConnectionError):
+        list(fetch_authors([str(i) for i in range(50)], call=down, deadline=10_000, min_interval=0,
+                           sleep=fc.sleep, clock=fc.clock))
+    assert len(set(calls)) == MAX_CONSECUTIVE_FAILURES
+
+
+def test_non_retryable_exception_becomes_fetch_error():
+    calls = []
+
+    def broken(i):
+        calls.append(i)
+        raise ValueError("bad data")
+
+    out = list(fetch_authors(["9"], call=broken, deadline=1000, min_interval=0, sleep=lambda s: None))
+    assert calls == ["9"] and "bad data" in out[0].fetch_error
+
+
+def test_no_retry_past_deadline():
+    fc = FakeClock()
+    calls = []
+
+    def flaky(i):
+        calls.append(i)
+        fc.t += 6
+        raise TebraTransientError("503")
+
+    out = list(fetch_authors(["1", "2"], call=flaky, deadline=6, min_interval=0, sleep=fc.sleep, clock=fc.clock))
+    assert out == [] and calls == ["1"]

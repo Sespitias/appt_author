@@ -35,7 +35,10 @@ Tebra limita esa llamada a 1 cada 250 ms, así que:
 | `WasCreatedOnline` | Reservada online por el paciente |
 | `CreatedAtUtc`, `UpdatedAtUtc` | Fechas reales en UTC según Tebra. Ojo: las fechas de `appointment_prod` son hora local del Pacífico etiquetada como UTC (7–8 h de diferencia) |
 | `AuthorsPending` | TRUE si la cita cambió en prod y el job todavía no la reprocesó (≤15 min normalmente) |
-| `AuthorsFetchError` | Tebra no devolvió la cita (por ejemplo, borrada). No se reintenta hasta que vuelva a cambiar en prod |
+| `AuthorsFetchError` | Tebra dijo que la cita no existe o no está autorizada, o la respuesta fue inválida. No se reintenta hasta que vuelva a cambiar en prod. Los errores desconocidos o de red **no** se guardan: la cita sigue pendiente y se reintenta en la próxima corrida |
+
+**Citas recurrentes:** en prod aparecen como `<ID de serie><sufijo>` (por ejemplo `163379KKF`). Para ellas se consulta
+la serie (`163379`), así que el creador y el modificador son los de la serie.
 
 **Historial (`appointment_author_history_named`):** una fila por cada modificación que el job ve. Si una cita cambia
 dos veces entre corridas (15 min), solo queda la última. Para las citas históricas solo se conoce su última modificación.
@@ -74,11 +77,13 @@ las variables `REPO`, `SECRET_*` y `REGION`.
  "pending_before": 240000, "pending_after": 237600, "stopped_by": "deadline"}
 ```
 
-- **`stopped_by`:** `done` (no quedó nada pendiente), `deadline` (se acabó el tiempo; sigue en la próxima corrida)
-  o `no_pending`.
-- **Errores que detienen la corrida:**
-  - credenciales inválidas: se detiene sin escribir nada;
-  - ≥20 citas leídas sin ningún `CreatedBy`: la respuesta de Tebra cambió.
+- **`stopped_by`:** `done` (no quedó nada pendiente), `deadline` (se acabó el tiempo; sigue en la próxima corrida),
+  `limit` (se llegó a `--limit`) o `no_pending`.
+- **Una cita que falla** después de 3 intentos se salta y sigue pendiente; no detiene la corrida.
+- **Errores que detienen la corrida** (lo ya leído se guarda antes de salir):
+  - credenciales o customer key inválidas;
+  - 5 citas seguidas fallando: Tebra está caído;
+  - ≥20 citas leídas (sin contar reservas online) sin ningún `CreatedBy`: la respuesta de Tebra cambió.
 
 ## Verificación
 
