@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SYNTHETIC fixture. Replace with the anonymised output of scripts/discover_fields.py
+     once the real field names are confirmed (README, "Campos Tebra"). -->
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <GetAppointmentsResponse xmlns="http://www.kareo.com/api/schemas/">
+      <GetAppointmentsResult xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+        <ErrorResponse><IsError>false</IsError></ErrorResponse>
+        <Appointments>
+          <AppointmentData>
+            <ID>900001</ID>
+            <ConfirmationStatus>Scheduled</ConfirmationStatus>
+            <CreatedDate>10/17/2026 9:15:00 AM</CreatedDate>
+            <LastModifiedDate>10/18/2026 2:40:10 PM</LastModifiedDate>
+            <CreatedByUserID>1001</CreatedByUserID>
+            <LastModifiedByUserID>1002</LastModifiedByUserID>
+            <PatientFullName>TEST PATIENT</PatientFullName>
+          </AppointmentData>
+          <AppointmentData>
+            <ID>900002</ID>
+            <ConfirmationStatus>Confirmed</ConfirmationStatus>
+            <CreatedDate>10/18/2026 8:00:00 AM</CreatedDate>
+            <LastModifiedDate>10/18/2026 8:00:00 AM</LastModifiedDate>
+            <CreatedByUserID>1001</CreatedByUserID>
+            <LastModifiedByUserID>1001</LastModifiedByUserID>
+            <PatientFullName>TEST PATIENT</PatientFullName>
+          </AppointmentData>
+          <AppointmentData>
+            <ID>900003</ID>
+            <ConfirmationStatus>Cancelled</ConfirmationStatus>
+            <CreatedDate>2026-10-10T11:30:00</CreatedDate>
+            <LastModifiedDate>2026-10-18T16:05:33</LastModifiedDate>
+            <CreatedByUserID></CreatedByUserID>
+            <LastModifiedByUserID>1003</LastModifiedByUserID>
+            <PatientFullName>TEST PATIENT</PatientFullName>
+          </AppointmentData>
+          <AppointmentData>
+            <ID>900004</ID>
+            <ConfirmationStatus>Scheduled</ConfirmationStatus>
+            <CreatedDate>10/18/2026 10:00:00 AM</CreatedDate>
+            <LastModifiedDate>10/18/2026 10:00:00 AM</LastModifiedDate>
+            <CreatedByUserID>0</CreatedByUserID>
+            <PatientFullName>TEST PATIENT</PatientFullName>
+          </AppointmentData>
+          <AppointmentData>
+            <ID>900005</ID>
+            <ConfirmationStatus>Check-out</ConfirmationStatus>
+            <CreatedDate>10/1/2026 1:02:03 PM</CreatedDate>
+            <LastModifiedDate>10/18/2026 5:59:59 PM</LastModifiedDate>
+            <CreatedByUserID> 1004 </CreatedByUserID>
+            <LastModifiedByUserID i:nil="true"/>
+            <PatientFullName>TEST PATIENT</PatientFullName>
+          </AppointmentData>
+        </Appointments>
+      </GetAppointmentsResult>
+    </GetAppointmentsResponse>
+  </s:Body>
+</s:Envelope>
