@@ -1,100 +1,143 @@
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from appt_authors.models import AppointmentAuthor
-from appt_authors.tebra_client import TebraError, fetch_appointment_authors, parse_appointments
+from appt_authors.tebra_client import (
+    TebraAuthError,
+    TebraTransientError,
+    fetch_authors,
+    parse_get_appointment,
+)
 
-FIXTURE = Path(__file__).parent / "fixtures" / "get_appointments.xml"
+FIXTURES = Path(__file__).parent / "fixtures"
 UTC = timezone.utc
 
 
-def _a(id_, modified, by="1"):
-    return AppointmentAuthor(id_, by, by, datetime(2026, 1, 1, tzinfo=UTC), modified, "Scheduled")
+def _fx(name):
+    return (FIXTURES / f"get_appointment_{name}.xml").read_bytes()
 
 
-def test_parse_fixture():
-    result = parse_appointments(FIXTURE.read_bytes())
-    assert len(result) == 5
-    assert all(isinstance(a.id, str) and a.id for a in result)
-    by_id = {a.id: a for a in result}
-    assert by_id["900001"].created_by_user_id == "1001"
-    assert by_id["900001"].last_modified_by_user_id == "1002"
-    assert by_id["900001"].created_date == datetime(2026, 10, 17, 9, 15, tzinfo=UTC)
-    assert by_id["900001"].last_modified_date == datetime(2026, 10, 18, 14, 40, 10, tzinfo=UTC)
-    assert by_id["900003"].last_modified_date == datetime(2026, 10, 18, 16, 5, 33, tzinfo=UTC)
-    assert by_id["900005"].created_by_user_id == "1004"
-    assert by_id["900005"].confirmation_status == "Check-out"
+# --- Task 1: parser -----------------------------------------------------------------------
+
+def test_parse_created_and_updated_by():
+    a = parse_get_appointment(_fx("251242"), "251242")
+    assert a.id == "251242"
+    assert a.created_by_user_id == "984392"
+    assert a.last_modified_by_user_id == "832888"
+    assert a.created_at_utc == datetime(2026, 10, 12, 16, 6, 18, tzinfo=UTC)
+    assert a.updated_at_utc == datetime(2026, 10, 19, 15, 50, 1, tzinfo=UTC)
+    assert a.was_created_online is False and a.is_deleted is False
+    assert a.fetch_error is None
 
 
-def test_blank_and_zero_user_ids_become_none():
-    by_id = {a.id: a for a in parse_appointments(FIXTURE.read_bytes())}
-    assert by_id["900003"].created_by_user_id is None          # ""
-    assert by_id["900004"].created_by_user_id is None          # "0"
-    assert by_id["900004"].last_modified_by_user_id is None    # absent
-    assert by_id["900005"].last_modified_by_user_id is None    # i:nil
+def test_updated_by_zero_becomes_none():
+    a = parse_get_appointment(_fx("252274"), "252274")
+    assert a.created_by_user_id == "832888"
+    assert a.last_modified_by_user_id is None
 
 
-def test_parse_respects_timezone():
-    result = parse_appointments(FIXTURE.read_bytes(), tz="America/New_York")
-    a = {x.id: x for x in result}["900001"]
-    assert a.created_date == datetime(2026, 10, 17, 13, 15, tzinfo=UTC)  # EDT = UTC-4
+def test_parse_not_found_sets_fetch_error():
+    a = parse_get_appointment(_fx("not_found"), "1")
+    assert a.id == "1"
+    assert "does not exist" in a.fetch_error
+    assert a.created_by_user_id is None and a.updated_at_utc is None
 
 
-def test_parse_raises_on_tebra_error():
-    xml = b"""<Envelope><Body><GetAppointmentsResult><ErrorResponse><IsError>true</IsError>
-    <ErrorMessage>Invalid credentials</ErrorMessage></ErrorResponse></GetAppointmentsResult></Body></Envelope>"""
-    with pytest.raises(TebraError, match="Invalid credentials"):
-        parse_appointments(xml)
+def test_auth_failure_raises():
+    with pytest.raises(TebraAuthError, match="Invalid user name"):
+        parse_get_appointment(_fx("bad_auth"), "251242")
 
 
-def test_chunks_window_by_day():
+def test_throttle_error_is_transient():
+    xml = _fx("bad_auth").replace(b"Invalid user name and/or password", b"Request was throttled").replace(
+        b"<Authenticated>false</Authenticated><Authorized>false</Authorized>",
+        b"<Authenticated>true</Authenticated><Authorized>true</Authorized>",
+    ).replace(b"<SecurityResultSuccess>false", b"<SecurityResultSuccess>true")
+    with pytest.raises(TebraTransientError):
+        parse_get_appointment(xml, "1")
+
+
+# --- Task 2: throttled fetch with retries -------------------------------------------------
+
+class FakeClock:
+    def __init__(self):
+        self.t = 0.0
+        self.sleeps = []
+
+    def clock(self):
+        return self.t
+
+    def sleep(self, s):
+        self.sleeps.append(s)
+        self.t += s
+
+
+def _author(i):
+    return AppointmentAuthor(str(i), "1", "2", None, None, False, False)
+
+
+def test_respects_min_interval():
+    fc = FakeClock()
+    out = list(fetch_authors(["1", "2", "3"], call=_author, deadline=100, min_interval=0.3,
+                             sleep=fc.sleep, clock=fc.clock))
+    assert [a.id for a in out] == ["1", "2", "3"]
+    assert sum(fc.sleeps) >= 2 * 0.3 - 1e-9
+
+
+def test_stops_at_deadline():
+    fc = FakeClock()
+
+    def slow(i):
+        fc.t += 1.0
+        return _author(i)
+
+    out = list(fetch_authors([str(i) for i in range(10)], call=slow, deadline=3.0, min_interval=0,
+                             sleep=fc.sleep, clock=fc.clock))
+    assert [a.id for a in out] == ["0", "1", "2"]
+
+
+def test_retries_transient_then_succeeds():
+    fc = FakeClock()
+    attempts = []
+
+    def flaky(i):
+        attempts.append(i)
+        if len(attempts) < 3:
+            raise TebraTransientError("503")
+        return _author(i)
+
+    out = list(fetch_authors(["7"], call=flaky, deadline=1000, min_interval=0, sleep=fc.sleep, clock=fc.clock))
+    assert [a.id for a in out] == ["7"] and len(attempts) == 3
+
+
+def test_gives_up_after_3_transient_errors_without_losing_previous():
+    fc = FakeClock()
+    got = []
+
+    def fail_on_b(i):
+        if i == "b":
+            raise ConnectionError("network down")
+        return _author(i)
+
+    with pytest.raises(ConnectionError):
+        for a in fetch_authors(["a", "b", "c"], call=fail_on_b, deadline=1000, min_interval=0,
+                               sleep=fc.sleep, clock=fc.clock):
+            got.append(a.id)
+    assert got == ["a"]
+
+
+def test_auth_error_not_retried():
     calls = []
 
-    def fake(start, end):
-        calls.append((start, end))
-        return []
+    def bad(i):
+        calls.append(i)
+        raise TebraAuthError("Invalid user name and/or password")
 
-    fetch_appointment_authors(datetime(2026, 10, 1, tzinfo=UTC), datetime(2026, 10, 4, tzinfo=UTC), call=fake)
-    assert calls == [
-        (datetime(2026, 10, 1, tzinfo=UTC), datetime(2026, 10, 2, tzinfo=UTC)),
-        (datetime(2026, 10, 2, tzinfo=UTC), datetime(2026, 10, 3, tzinfo=UTC)),
-        (datetime(2026, 10, 3, tzinfo=UTC), datetime(2026, 10, 4, tzinfo=UTC)),
-    ]
-
-
-def test_halves_window_on_error():
-    calls = []
-
-    def fake(start, end):
-        calls.append(end - start)
-        if end - start > timedelta(hours=12):
-            raise RuntimeError("too many records")
-        return [_a(f"{start.hour}", end)]
-
-    out = fetch_appointment_authors(datetime(2026, 10, 1, tzinfo=UTC), datetime(2026, 10, 2, tzinfo=UTC), call=fake)
-    assert calls == [timedelta(days=1), timedelta(hours=12), timedelta(hours=12)]
-    assert len(out) == 2
-
-
-def test_raises_when_window_cannot_shrink():
-    def fake(start, end):
-        raise RuntimeError("boom")
-
-    with pytest.raises(RuntimeError, match="boom"):
-        fetch_appointment_authors(datetime(2026, 10, 1, tzinfo=UTC), datetime(2026, 10, 1, 1, tzinfo=UTC), call=fake)
-
-
-def test_dedupes_by_id_keeping_latest_modified():
-    t1, t2 = datetime(2026, 10, 1, 9, tzinfo=UTC), datetime(2026, 10, 1, 10, tzinfo=UTC)
-
-    def fake(start, end):
-        return [_a("1", t2, by="new"), _a("1", t1, by="old"), _a("2", t1)]
-
-    out = {a.id: a for a in fetch_appointment_authors(t1, t1 + timedelta(hours=1), call=fake)}
-    assert len(out) == 2
-    assert out["1"].last_modified_by_user_id == "new"
+    with pytest.raises(TebraAuthError):
+        list(fetch_authors(["1", "2"], call=bad, deadline=1000, min_interval=0, sleep=lambda s: None))
+    assert calls == ["1"]
 
 
 def test_client_sets_soap_timeouts(monkeypatch):

@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Real Tebra GetAppointment response, 2026-10-19, reduced to author fields (no patient data). -->
+<s:Envelope xmlns="http://www.kareo.com/api/schemas/" xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><s:Body><GetAppointmentResponse><GetAppointmentResult><ErrorResponse><ErrorMessage>Invalid user name and/or password</ErrorMessage><IsError>true</IsError><StackTrace /></ErrorResponse><SecurityResponse><Authenticated>false</Authenticated><Authorized>false</Authorized><CustomerKeyValid>true</CustomerKeyValid><SecurityResultSuccess>false</SecurityResultSuccess></SecurityResponse><Appointment xsi:nil="true" /></GetAppointmentResult></GetAppointmentResponse></s:Body></s:Envelope>

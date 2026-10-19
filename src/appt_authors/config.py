@@ -16,14 +16,11 @@ class Settings:
     tebra_user: str | None = field(default_factory=lambda: _env("TEBRA_USER"))
     tebra_password: str | None = field(default_factory=lambda: _env("TEBRA_PASSWORD"))
     tebra_wsdl: str = field(default_factory=lambda: _env("TEBRA_WSDL", DEFAULT_WSDL))
-    # Timezone of the naive datetimes Tebra returns; "UTC" stores them as-is.
-    tebra_timezone: str = field(default_factory=lambda: _env("TEBRA_TIMEZONE", "UTC"))
-
-    # Tebra field / filter names. Confirm with scripts/discover_fields.py (see README).
-    created_by_field: str = field(default_factory=lambda: _env("TEBRA_CREATED_BY_FIELD", "CreatedByUserID"))
-    modified_by_field: str = field(default_factory=lambda: _env("TEBRA_MODIFIED_BY_FIELD", "LastModifiedByUserID"))
-    from_modified_filter: str = field(default_factory=lambda: _env("TEBRA_FROM_MODIFIED_FILTER", "FromLastModifiedDate"))
-    to_modified_filter: str = field(default_factory=lambda: _env("TEBRA_TO_MODIFIED_FILTER", "ToLastModifiedDate"))
+    # Tebra throttles GetAppointment to one call per 250 ms.
+    min_interval: float = field(default_factory=lambda: float(_env("TEBRA_MIN_INTERVAL", "0.30")))
+    # Keep each run well under the 15-minute schedule so runs never overlap.
+    max_run_seconds: float = field(default_factory=lambda: float(_env("MAX_RUN_SECONDS", "720")))
+    batch_size: int = field(default_factory=lambda: int(_env("BATCH_SIZE", "500")))
 
     bq_project: str = field(default_factory=lambda: _env("BQ_PROJECT", "weekly-revenue-integration"))
     bq_dataset: str = field(default_factory=lambda: _env("BQ_DATASET", "Telemind_BD"))
