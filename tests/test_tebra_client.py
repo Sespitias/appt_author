@@ -95,3 +95,22 @@ def test_dedupes_by_id_keeping_latest_modified():
     out = {a.id: a for a in fetch_appointment_authors(t1, t1 + timedelta(hours=1), call=fake)}
     assert len(out) == 2
     assert out["1"].last_modified_by_user_id == "new"
+
+
+def test_client_sets_soap_timeouts(monkeypatch):
+    import zeep
+
+    from appt_authors import tebra_client
+    from appt_authors.config import Settings
+
+    captured = {}
+
+    class FakeZeep:
+        def __init__(self, wsdl, transport=None):
+            captured["transport"] = transport
+
+    monkeypatch.setattr(zeep, "Client", FakeZeep)
+    s = Settings(tebra_customer_key="k", tebra_user="u", tebra_password="p")
+    tebra_client.TebraClient(s)
+    t = captured["transport"]
+    assert t is not None and t.operation_timeout == 300 and t.load_timeout == 60

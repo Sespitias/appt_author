@@ -1,13 +1,5 @@
 -- Tables owned by tebra-appt-authors. Never touches appointment_prod / appointment_update.
-CREATE TABLE IF NOT EXISTS `weekly-revenue-integration.Telemind_BD.appointment_authors_staging` (
-  ID STRING NOT NULL,
-  CreatedByUserID STRING,
-  LastModifiedByUserID STRING,
-  CreatedDate TIMESTAMP,
-  LastModifiedDate TIMESTAMP,
-  ConfirmationStatus STRING
-);
-
+-- Staging tables are per run (appointment_authors_staging_<run id>), created and dropped by the job.
 CREATE TABLE IF NOT EXISTS `weekly-revenue-integration.Telemind_BD.appointment_authors` (
   ID STRING NOT NULL,
   CreatedByUserID STRING,

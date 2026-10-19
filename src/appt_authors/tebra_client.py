@@ -80,11 +80,13 @@ def parse_appointments(xml: bytes | str, settings: Settings | None = None, tz: s
 class TebraClient:
     def __init__(self, settings: Settings | None = None):
         from zeep import Client  # imported lazily so unit tests don't need the WSDL
+        from zeep.transports import Transport
 
         self.s = settings or Settings()
         if not (self.s.tebra_customer_key and self.s.tebra_user and self.s.tebra_password):
             raise TebraError("Set TEBRA_CUSTOMER_KEY, TEBRA_USER and TEBRA_PASSWORD")
-        self.client = Client(self.s.tebra_wsdl)
+        # Bounded waits: a hung call must fail well before the next 15-min run starts.
+        self.client = Client(self.s.tebra_wsdl, transport=Transport(timeout=60, operation_timeout=300))
 
     def _tebra_time(self, dt: datetime) -> str:
         return dt.astimezone(ZoneInfo(self.s.tebra_timezone)).strftime("%Y-%m-%dT%H:%M:%S")

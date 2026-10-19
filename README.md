@@ -33,8 +33,16 @@ Procedimiento:
 4. Abrir 3 de esas citas en la UI de Tebra (historial/auditoría de la cita) y comprobar que el ID corresponde a la persona correcta.
 5. Anonimizar el XML (nombres de paciente → `TEST`), copiarlo a `tests/fixtures/get_appointments.xml`, actualizar
    los valores esperados en `tests/test_tebra_client.py::test_parse_fixture` y correr `pytest`.
-6. Zona horaria: comparar `LastModifiedDate` de 3 citas contra `appointment_prod` (mismo `ID`). Si no coinciden,
-   definir `TEBRA_TIMEZONE` (por ejemplo `America/New_York`). El default `UTC` guarda la hora tal como llega.
+6. **Zona horaria (obligatorio antes del deploy):** después de una primera corrida corta
+   (`backfill --start <ayer> --end <hoy>`), comprobar que las horas coinciden con `appointment_prod`:
+   ```sql
+   SELECT COUNTIF(a.LastModifiedDate != p.LastModifiedDate) AS distintas, COUNT(*) AS total,
+          APPROX_TOP_COUNT(TIMESTAMP_DIFF(a.LastModifiedDate, p.LastModifiedDate, HOUR), 3) AS desfase_horas
+   FROM Telemind_BD.appointment_authors a JOIN Telemind_BD.appointment_prod p USING (ID)
+   WHERE a.LastModifiedDate >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 DAY)
+   ```
+   Si `desfase_horas` es constante (por ejemplo 4 o 5), definir `TEBRA_TIMEZONE` (por ejemplo `America/New_York`) y repetir.
+   El default `UTC` guarda la hora tal como llega.
 
 **Si Tebra no devuelve el modificador:** se detiene el despliegue y se evalúa la alternativa (reporte de auditoría exportado de Tebra).
 
@@ -49,6 +57,11 @@ Sheet **"Tebra Users"**, pestaña `users`, encabezados en la fila 1:
 - Compartirla (lector) con quien consulte `appointment_prod_authors` en BigQuery (personas, Looker Studio, service accounts). BigQuery lee la Sheet con las credenciales de quien hace la consulta; el job no la lee.
 - Cada día revisar `SELECT * FROM Telemind_BD.tebra_users_unmapped` y añadir los IDs que falten.
 - Si un ID aparece dos veces, la vista `tebra_users` se queda con la fila activa (no duplica citas).
+- Las citas sin ID de usuario (vacío o `0`: portal, procesos automáticos) quedan con nombre NULL. La fila `__SYSTEM__`
+  es solo una referencia. Si el portal usa un ID real distinto de 0, aparecerá en `tebra_users_unmapped`; añádelo con ese ID.
+
+El job falla a propósito si una tanda de ≥20 citas llega sin ningún ID de creador ni de modificador
+(eso indica que los nombres de los campos están mal configurados). Cada corrida imprime `null_created_by` / `null_modified_by`.
 
 ## Despliegue
 
@@ -61,8 +74,8 @@ bq query --use_legacy_sql=false < sql/03_views.sql
 # 2. Job + scheduler (*/15)
 ./deploy.sh
 
-# 3. Backfill (una vez; internamente va mes a mes). Recomendado por años para que cada ejecución sea corta:
-gcloud run jobs execute tebra-appt-authors --region us-central1 --args="backfill,--start,2018-09-01,--end,2020-01-01"
+# 3. Backfill (una vez; internamente va mes a mes). Por tramos, UNO DESPUÉS DE OTRO (--wait):
+gcloud run jobs execute tebra-appt-authors --region us-central1 --wait --args="backfill,--start,2018-09-01,--end,2020-01-01"
 # ... repetir por tramos hasta hoy; luego activar el scheduler (se crea en pausa):
 gcloud scheduler jobs resume tebra-appt-authors-15m --location us-central1
 ```

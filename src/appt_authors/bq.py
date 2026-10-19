@@ -1,6 +1,6 @@
 """BigQuery side: watermark, staging load, MERGE into current, append to history."""
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 
 from google.cloud import bigquery
 
@@ -68,6 +68,10 @@ class Tables:
             history=s.table(f"appointment_author_history{suffix}"),
         )
 
+    def for_run(self, run_id: str) -> "Tables":
+        """Same tables, but a staging table private to one run (concurrent runs can't clobber it)."""
+        return replace(self, staging=self.staging[:-1] + f"_{run_id}`")
+
     def fmt(self, sql: str) -> str:
         return sql.format(staging=self.staging, current=self.current, history=self.history)
 
@@ -98,7 +102,14 @@ def load_staging(client: bigquery.Client, tables: Tables, rows: list[Appointment
     config = bigquery.LoadJobConfig(schema=STAGING_SCHEMA, write_disposition="WRITE_TRUNCATE")
     destination = tables.staging.strip("`")
     client.load_table_from_json([_to_row(r) for r in rows], destination, job_config=config).result()
+    table = client.get_table(destination)
+    table.expires = datetime.now(timezone.utc) + timedelta(days=1)  # safety net if the run dies before dropping it
+    client.update_table(table, ["expires"])
     return len(rows)
+
+
+def drop_staging(client: bigquery.Client, tables: Tables) -> None:
+    client.delete_table(tables.staging.strip("`"), not_found_ok=True)
 
 
 def merge_current(client: bigquery.Client, tables: Tables) -> int:
