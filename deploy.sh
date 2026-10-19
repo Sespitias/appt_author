@@ -26,10 +26,19 @@ gcloud config set project "$PROJECT" >/dev/null
 # Service account + permissions (idempotent).
 gcloud iam service-accounts describe "$SA" >/dev/null 2>&1 || \
   gcloud iam service-accounts create "$SA_NAME" --display-name "Tebra appointment authors job"
-gcloud projects add-iam-policy-binding "$PROJECT" --member "serviceAccount:$SA" --role roles/bigquery.jobUser --condition=None >/dev/null
-bq add-iam-policy-binding --member="serviceAccount:$SA" --role=roles/bigquery.dataEditor "${PROJECT}:Telemind_BD" >/dev/null
+
+# A brand-new service account takes a while to become visible to IAM policy bindings.
+retry() {
+  for i in 1 2 3 4 5 6; do
+    "$@" >/dev/null 2>&1 && return 0
+    echo "  waiting for IAM to see $SA (attempt $i)..."; sleep $((i * 10))
+  done
+  "$@"  # last try, showing the error
+}
+retry gcloud projects add-iam-policy-binding "$PROJECT" --member "serviceAccount:$SA" --role roles/bigquery.jobUser --condition=None
+retry bq add-iam-policy-binding --member="serviceAccount:$SA" --role=roles/bigquery.dataEditor "${PROJECT}:Telemind_BD"
 for s in "$SECRET_CUSTOMER_KEY" "$SECRET_USER" "$SECRET_PASSWORD"; do
-  gcloud secrets add-iam-policy-binding "$s" --member "serviceAccount:$SA" --role roles/secretmanager.secretAccessor >/dev/null
+  retry gcloud secrets add-iam-policy-binding "$s" --member "serviceAccount:$SA" --role roles/secretmanager.secretAccessor
 done
 
 gcloud builds submit --tag "$IMAGE" .
