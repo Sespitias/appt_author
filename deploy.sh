@@ -45,6 +45,9 @@ echo "==> Secret access"
 for s in "$SECRET_CUSTOMER_KEY" "$SECRET_USER" "$SECRET_PASSWORD"; do
   retry gcloud secrets add-iam-policy-binding "$s" --member "serviceAccount:$SA" --role roles/secretmanager.secretAccessor
 done
+echo "==> Artifact Registry repo '$REPO'"
+gcloud artifacts repositories describe "$REPO" --location "$REGION" >/dev/null 2>&1 || \
+  gcloud artifacts repositories create "$REPO" --repository-format=docker --location "$REGION"
 echo "==> Building image (2-4 min)"
 
 gcloud builds submit --tag "$IMAGE" .
