@@ -17,12 +17,9 @@ SECRET_CUSTOMER_KEY="${SECRET_CUSTOMER_KEY:-TEBRA_CUSTOMER_KEY}"
 SECRET_USER="${SECRET_USER:-TEBRA_USER}"
 SECRET_PASSWORD="${SECRET_PASSWORD:-TEBRA_PASSWORD}"
 
-# Tebra field names — confirm with scripts/discover_fields.py (README, "Campos Tebra").
-ENV_VARS="BQ_PROJECT=${PROJECT},BQ_DATASET=Telemind_BD,TEBRA_TIMEZONE=${TEBRA_TIMEZONE:-UTC}"
-ENV_VARS+=",TEBRA_CREATED_BY_FIELD=${TEBRA_CREATED_BY_FIELD:-CreatedByUserID}"
-ENV_VARS+=",TEBRA_MODIFIED_BY_FIELD=${TEBRA_MODIFIED_BY_FIELD:-LastModifiedByUserID}"
-ENV_VARS+=",TEBRA_FROM_MODIFIED_FILTER=${TEBRA_FROM_MODIFIED_FILTER:-FromLastModifiedDate}"
-ENV_VARS+=",TEBRA_TO_MODIFIED_FILTER=${TEBRA_TO_MODIFIED_FILTER:-ToLastModifiedDate}"
+# Tuning (see README): Tebra allows one GetAppointment call per 250 ms.
+ENV_VARS="BQ_PROJECT=${PROJECT},BQ_DATASET=Telemind_BD"
+ENV_VARS+=",TEBRA_MIN_INTERVAL=${TEBRA_MIN_INTERVAL:-0.30},MAX_RUN_SECONDS=${MAX_RUN_SECONDS:-720},BATCH_SIZE=${BATCH_SIZE:-500}"
 
 gcloud config set project "$PROJECT" >/dev/null
 
@@ -39,7 +36,7 @@ gcloud builds submit --tag "$IMAGE" .
 
 gcloud run jobs deploy "$JOB" \
   --image "$IMAGE" --region "$REGION" --service-account "$SA" \
-  --task-timeout 21600 --max-retries 1 \
+  --task-timeout 900 --max-retries 0 --parallelism 1 --tasks 1 \
   --set-env-vars "$ENV_VARS" \
   --set-secrets "TEBRA_CUSTOMER_KEY=${SECRET_CUSTOMER_KEY}:latest,TEBRA_USER=${SECRET_USER}:latest,TEBRA_PASSWORD=${SECRET_PASSWORD}:latest"
 
@@ -50,9 +47,10 @@ if gcloud scheduler jobs describe "${JOB}-15m" --location "$REGION" >/dev/null 2
   gcloud scheduler jobs update http "${JOB}-15m" --location "$REGION" --schedule "*/15 * * * *" --uri "$URI" \
     --http-method POST --oauth-service-account-email "$SA"
 else
+  # Runs every 15 min; each run works at most MAX_RUN_SECONDS, so runs never overlap.
+  # The historical backlog drains automatically, newest appointments first.
   gcloud scheduler jobs create http "${JOB}-15m" --location "$REGION" --schedule "*/15 * * * *" --uri "$URI" \
-    --http-method POST --oauth-service-account-email "$SA" --paused
-  echo "Scheduler created PAUSED. Run the backfill first, then: gcloud scheduler jobs resume ${JOB}-15m --location $REGION"
+    --http-method POST --oauth-service-account-email "$SA"
 fi
 
 echo "Done. The job does not read the Google Sheet; share 'Tebra Users' (Viewer) with the people/service accounts that query appointment_prod_authors."

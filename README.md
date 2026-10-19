@@ -1,67 +1,55 @@
 # tebra-appt-authors
 
-Cloud Run Job que registra **quién creó** y **quién modificó por última vez** cada cita de Tebra,
-y publica en BigQuery `Telemind_BD.appointment_prod_authors` (= `appointment_prod` + nombre/email
-del creador y del último modificador). Es independiente del servicio que ya carga `appointment_prod`.
+Cloud Run Job que registra **quién creó** y **quién modificó por última vez** cada cita de Tebra, y publica en
+BigQuery `Telemind_BD.appointment_prod_authors` = `appointment_prod` + nombre y email del creador y del último
+modificador. Es independiente del servicio que ya carga `appointment_prod` y nunca escribe en sus tablas.
 
 ```
-Tebra SOAP GetAppointments (filtrado por LastModifiedDate)
-   └─> appointment_authors_staging ──MERGE──> appointment_authors        (1 fila por ID)
-                                   └─INSERT─> appointment_author_history (1 fila por ID+LastModifiedDate)
-Google Sheet "Tebra Users" ─> tebra_users_raw (externa) ─> tebra_users (vista dedup)
-appointment_prod + appointment_authors + tebra_users ─> appointment_prod_authors (vista)
+appointment_prod (servicio actual) ──> citas pendientes: nuevas, o cambiadas desde la última vez (las más nuevas primero)
+        │                                   │
+        │                     Tebra SOAP GetAppointment(ID) ── CreatedBy / UpdatedBy (IDs de usuario)
+        │                                   │  (1 llamada cada 0.3 s, máx. 12 min por corrida, cada 15 min)
+        │                                   ▼
+        │        appointment_authors (1 fila por cita)  +  appointment_author_history (1 fila por modificación)
+        ▼                                   │
+appointment_prod_authors (vista) <──────────┘ <── tebra_users (vista) <── Google Sheet "Tebra Users"
 ```
 
-## Campos Tebra (Tarea 1: hay que confirmarlos antes del primer deploy)
+## Por qué GetAppointment
 
-Los nombres de los campos y filtros se pueden configurar con variables de entorno.
-Los valores por defecto son **suposiciones** basadas en la convención de nombres de Kareo:
+`GetAppointments` (el listado que usa el servicio actual) **no** tiene campos de usuario. Solo `GetAppointment`
+(una cita por llamada) devuelve `CreatedBy` / `UpdatedBy`. Esto se verificó contra la API el 2026-10-19.
+Tebra limita esa llamada a 1 cada 250 ms, así que:
 
-| Variable | Default | Confirmado |
-|---|---|---|
-| `TEBRA_CREATED_BY_FIELD` | `CreatedByUserID` | ☐ |
-| `TEBRA_MODIFIED_BY_FIELD` | `LastModifiedByUserID` | ☐ |
-| `TEBRA_FROM_MODIFIED_FILTER` | `FromLastModifiedDate` | ☐ |
-| `TEBRA_TO_MODIFIED_FILTER` | `ToLastModifiedDate` | ☐ |
+- **Día a día:** unas 100 citas cambiadas al día se procesan en segundos.
+- **Histórico (~246k citas):** se completa solo, unas 2,400 citas por corrida, en ~1–2 días. Las citas de hoy
+  siempre van primero, porque el orden es por `LastModifiedDate` descendente.
+- **Para revisar una cita a mano:** `python scripts/probe_appointment.py --ids 251242,252274`.
 
-Procedimiento:
+## Significado de los campos
 
-1. `pip install -r requirements.txt`
-2. `TEBRA_CUSTOMER_KEY=... TEBRA_USER=... TEBRA_PASSWORD=... python scripts/discover_fields.py --date 2026-10-18 --out /tmp/discovery.xml`
-   El script imprime los elementos del WSDL relacionados con usuarios y fechas, y los campos de usuario presentes en la respuesta real.
-3. Ajustar las 4 variables (en `deploy.sh`) si los nombres no coinciden con los defaults.
-4. Abrir 3 de esas citas en la UI de Tebra (historial/auditoría de la cita) y comprobar que el ID corresponde a la persona correcta.
-5. Anonimizar el XML (nombres de paciente → `TEST`), copiarlo a `tests/fixtures/get_appointments.xml`, actualizar
-   los valores esperados en `tests/test_tebra_client.py::test_parse_fixture` y correr `pytest`.
-6. **Zona horaria (obligatorio antes del deploy):** después de una primera corrida corta
-   (`backfill --start <ayer> --end <hoy>`), comprobar que las horas coinciden con `appointment_prod`:
-   ```sql
-   SELECT COUNTIF(a.LastModifiedDate != p.LastModifiedDate) AS distintas, COUNT(*) AS total,
-          APPROX_TOP_COUNT(TIMESTAMP_DIFF(a.LastModifiedDate, p.LastModifiedDate, HOUR), 3) AS desfase_horas
-   FROM Telemind_BD.appointment_authors a JOIN Telemind_BD.appointment_prod p USING (ID)
-   WHERE a.LastModifiedDate >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 DAY)
-   ```
-   Si `desfase_horas` es constante (por ejemplo 4 o 5), definir `TEBRA_TIMEZONE` (por ejemplo `America/New_York`) y repetir.
-   El default `UTC` guarda la hora tal como llega.
+| Campo | Significado |
+|---|---|
+| `CreatedByUserID` / `CreatedByName` / `CreatedByEmail` | Usuario de Tebra que creó la cita |
+| `LastModifiedByUserID` / `…Name` / `…Email` | Último usuario que la modificó. Tebra devuelve `UpdatedBy=0` si no se modificó desde su creación: entonces es el creador |
+| `WasCreatedOnline` | Reservada online por el paciente |
+| `CreatedAtUtc`, `UpdatedAtUtc` | Fechas reales en UTC según Tebra. Ojo: las fechas de `appointment_prod` son hora local del Pacífico etiquetada como UTC (7–8 h de diferencia) |
+| `AuthorsPending` | TRUE si la cita cambió en prod y el job todavía no la reprocesó (≤15 min normalmente) |
+| `AuthorsFetchError` | Tebra no devolvió la cita (por ejemplo, borrada). No se reintenta hasta que vuelva a cambiar en prod |
 
-**Si Tebra no devuelve el modificador:** se detiene el despliegue y se evalúa la alternativa (reporte de auditoría exportado de Tebra).
+**Historial (`appointment_author_history_named`):** una fila por cada modificación que el job ve. Si una cita cambia
+dos veces entre corridas (15 min), solo queda la última. Para las citas históricas solo se conoce su última modificación.
 
 ## Mantener usuarios (Google Sheet)
 
-Sheet **"Tebra Users"**, pestaña `users`, encabezados en la fila 1:
+[Tebra Users](https://docs.google.com/spreadsheets/d/10tGKwQq1u7fKJcVStjdFdKdEcCGCQCb1a4B2BM6j9a8/edit),
+pestaña `users`, con encabezados `user_id | full_name | email | role | active`.
 
-| user_id | full_name | email | role | active |
-|---|---|---|---|---|
-| `__SYSTEM__` | Sistema / Portal | | system | TRUE |
-
-- Compartirla (lector) con quien consulte `appointment_prod_authors` en BigQuery (personas, Looker Studio, service accounts). BigQuery lee la Sheet con las credenciales de quien hace la consulta; el job no la lee.
-- Cada día revisar `SELECT * FROM Telemind_BD.tebra_users_unmapped` y añadir los IDs que falten.
-- Si un ID aparece dos veces, la vista `tebra_users` se queda con la fila activa (no duplica citas).
-- Las citas sin ID de usuario (vacío o `0`: portal, procesos automáticos) quedan con nombre NULL. La fila `__SYSTEM__`
-  es solo una referencia. Si el portal usa un ID real distinto de 0, aparecerá en `tebra_users_unmapped`; añádelo con ese ID.
-
-El job falla a propósito si una tanda de ≥20 citas llega sin ningún ID de creador ni de modificador
-(eso indica que los nombres de los campos están mal configurados). Cada corrida imprime `null_created_by` / `null_modified_by`.
+- **Qué IDs añadir:** cada día revisar `SELECT * FROM Telemind_BD.tebra_users_unmapped` (IDs sin nombre, ordenados
+  por cuántas citas tocan) y añadirlos a la Sheet.
+- **IDs duplicados:** si un ID aparece dos veces, la vista `tebra_users` se queda con la fila activa, así que no se duplican citas.
+- **Acceso:** compartir la Sheet (lector) con quien consulte `appointment_prod_authors`: personas, Looker Studio y
+  service accounts. BigQuery la lee con las credenciales de quien hace la consulta; el job no la necesita.
 
 ## Despliegue
 
@@ -71,39 +59,44 @@ bq query --use_legacy_sql=false < sql/01_tables.sql
 sed 's|${SHEET_URL}|https://docs.google.com/spreadsheets/d/10tGKwQq1u7fKJcVStjdFdKdEcCGCQCb1a4B2BM6j9a8|' sql/02_users_external.sql | bq query --use_legacy_sql=false
 bq query --use_legacy_sql=false < sql/03_views.sql
 
-# 2. Job + scheduler (*/15)
+# 2. Job + scheduler cada 15 min (desde Cloud Shell; usa los secretos TEBRA_* de Secret Manager)
 ./deploy.sh
-
-# 3. Backfill (una vez; internamente va mes a mes). Por tramos, UNO DESPUÉS DE OTRO (--wait):
-gcloud run jobs execute tebra-appt-authors --region us-central1 --wait --args="backfill,--start,2018-09-01,--end,2020-01-01"
-# ... repetir por tramos hasta hoy; luego activar el scheduler (se crea en pausa):
-gcloud scheduler jobs resume tebra-appt-authors-15m --location us-central1
 ```
 
-Nota: el backfill solo puede recuperar el **último** modificador de cada cita histórica.
-El historial completo de modificaciones empieza el día en que se activa el job, y si una cita
-cambia dos veces entre corridas (15 min) solo se registra el último cambio.
+`deploy.sh` asume que existen el repo `cloud-run` de Artifact Registry, las APIs de Run, Scheduler y Build
+habilitadas, y los secretos `TEBRA_CUSTOMER_KEY`, `TEBRA_USER` y `TEBRA_PASSWORD`. Se puede cambiar con
+las variables `REPO`, `SECRET_*` y `REGION`.
+
+## Salida de cada corrida (logs de Cloud Run)
+
+```json
+{"processed": 2400, "merged": 2400, "history_added": 2390, "fetch_errors": 3, "null_created_by": 0,
+ "pending_before": 240000, "pending_after": 237600, "stopped_by": "deadline"}
+```
+
+- **`stopped_by`:** `done` (no quedó nada pendiente), `deadline` (se acabó el tiempo; sigue en la próxima corrida)
+  o `no_pending`.
+- **Errores que detienen la corrida:**
+  - credenciales inválidas: se detiene sin escribir nada;
+  - ≥20 citas leídas sin ningún `CreatedBy`: la respuesta de Tebra cambió.
 
 ## Verificación
 
 ```sql
--- sin explosión por el JOIN
+-- sin multiplicación de filas por el JOIN
 SELECT (SELECT COUNT(*) FROM Telemind_BD.appointment_prod_authors) = (SELECT COUNT(*) FROM Telemind_BD.appointment_prod);
--- cobertura de los últimos 30 días (objetivo ≥ 95% una vez completa la Sheet)
+-- progreso del histórico
+SELECT COUNTIF(CreatedByUserID IS NULL AND AuthorsFetchError IS NULL) AS sin_autor, COUNT(*) AS total
+FROM Telemind_BD.appointment_prod_authors;
+-- cobertura de nombres de los últimos 30 días (objetivo ≥ 95% con la Sheet completa)
 SELECT COUNTIF(CreatedByEmail IS NOT NULL) / COUNT(*) FROM Telemind_BD.appointment_prod_authors
-WHERE CreatedDate >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY);
--- IDs sin mapear
-SELECT * FROM Telemind_BD.tebra_users_unmapped;
--- desfase prod vs authors hoy
-SELECT COUNTIF(a.LastModifiedDate IS NULL OR a.LastModifiedDate < p.LastModifiedDate) AS atrasadas
-FROM Telemind_BD.appointment_prod p LEFT JOIN Telemind_BD.appointment_authors a USING (ID)
-WHERE DATE(p.LastModifiedDate) = CURRENT_DATE();
+WHERE CreatedAtUtc >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY);
 ```
 
 ## Tests
 
 ```bash
 pip install -r requirements.txt
-pytest -v                      # unit tests
-RUN_BQ_TESTS=1 pytest -v -m bq  # integration tests against Telemind_Test_DB (need GCP credentials)
+pytest -v                       # unitarios (fixtures = respuestas reales de Tebra sin datos de pacientes)
+RUN_BQ_TESTS=1 pytest -v -m bq  # integración contra Telemind_Test_DB (requiere credenciales GCP)
 ```
