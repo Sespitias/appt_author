@@ -16,6 +16,8 @@ class Settings:
     tebra_user: str | None = field(default_factory=lambda: _env("TEBRA_USER"))
     tebra_password: str | None = field(default_factory=lambda: _env("TEBRA_PASSWORD"))
     tebra_wsdl: str = field(default_factory=lambda: _env("TEBRA_WSDL", DEFAULT_WSDL))
+    # Timezone of the naive datetimes Tebra returns; "UTC" stores them as-is.
+    tebra_timezone: str = field(default_factory=lambda: _env("TEBRA_TIMEZONE", "UTC"))
 
     # Tebra field / filter names. Confirm with scripts/discover_fields.py (see README).
     created_by_field: str = field(default_factory=lambda: _env("TEBRA_CREATED_BY_FIELD", "CreatedByUserID"))
