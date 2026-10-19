@@ -46,7 +46,7 @@ Sheet **"Tebra Users"**, pestaña `users`, encabezados en la fila 1:
 |---|---|---|---|---|
 | `__SYSTEM__` | Sistema / Portal | | system | TRUE |
 
-- Compartirla (lector) con la service account del job y con quien consulte BigQuery.
+- Compartirla (lector) con quien consulte `appointment_prod_authors` en BigQuery (personas, Looker Studio, service accounts). BigQuery lee la Sheet con las credenciales de quien hace la consulta; el job no la lee.
 - Cada día revisar `SELECT * FROM Telemind_BD.tebra_users_unmapped` y añadir los IDs que falten.
 - Si un ID aparece dos veces, la vista `tebra_users` se queda con la fila activa (no duplica citas).
 
@@ -61,9 +61,10 @@ bq query --use_legacy_sql=false < sql/03_views.sql
 # 2. Job + scheduler (*/15)
 ./deploy.sh
 
-# 3. Backfill (una vez; por meses)
-gcloud run jobs execute tebra-appt-authors --region us-central1 \
-  --args="-m,appt_authors.main,backfill,--start,2018-09-01"
+# 3. Backfill (una vez; internamente va mes a mes). Recomendado por años para que cada ejecución sea corta:
+gcloud run jobs execute tebra-appt-authors --region us-central1 --args="backfill,--start,2018-09-01,--end,2020-01-01"
+# ... repetir por tramos hasta hoy; luego activar el scheduler (se crea en pausa):
+gcloud scheduler jobs resume tebra-appt-authors-15m --location us-central1
 ```
 
 Nota: el backfill solo puede recuperar el **último** modificador de cada cita histórica.
