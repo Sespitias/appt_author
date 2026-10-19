@@ -1,57 +1,64 @@
-"""Entrypoint: python -m appt_authors.main incremental | backfill --start YYYY-MM-DD [--end YYYY-MM-DD]"""
+"""Entrypoint: python -m appt_authors.main [--max-seconds N] [--limit N]
+
+Each run takes the appointments that appointment_prod has but appointment_authors lacks (or that changed
+in prod since we last fetched them), newest first, asks Tebra GetAppointment who created / last modified
+each one, and writes them to BigQuery every `batch_size` rows until done or out of time.
+"""
 import argparse
 import json
 import logging
+import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from typing import Callable
 
-from .bq import Tables, append_history, drop_staging, get_watermark, load_staging, merge_current
+from .bq import (
+    Tables,
+    append_history,
+    count_pending,
+    drop_staging,
+    get_pending,
+    load_staging,
+    merge_current,
+)
 from .config import Settings
 from .models import AppointmentAuthor
-from .tebra_client import TebraClient, fetch_appointment_authors
+from .tebra_client import TebraClient, fetch_authors
 
-OVERLAP = timedelta(hours=2)
-# A batch this large with no author IDs at all means the configured Tebra field names are wrong.
+# A batch this large with no creator at all means Tebra stopped returning the field.
 NULL_AUTHORS_MIN_ROWS = 20
-
-Fetch = Callable[[datetime, datetime], list[AppointmentAuthor]]
-
-
-def _month_windows(start: datetime, end: datetime):
-    cursor = start
-    while cursor < end:
-        first_next = (cursor.replace(day=1) + timedelta(days=32)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        nxt = min(first_next, end)
-        yield cursor, nxt
-        cursor = nxt
 
 
 def _check_authors(rows: list[AppointmentAuthor]) -> None:
-    if len(rows) >= NULL_AUTHORS_MIN_ROWS and all(
-        r.created_by_user_id is None and r.last_modified_by_user_id is None for r in rows
-    ):
+    fetched = [r for r in rows if r.fetch_error is None]
+    if len(fetched) >= NULL_AUTHORS_MIN_ROWS and all(r.created_by_user_id is None for r in fetched):
         raise SystemExit(
-            f"{len(rows)} appointments and none has a creator/modifier ID: check the Tebra field names "
-            "(TEBRA_CREATED_BY_FIELD / TEBRA_MODIFIED_BY_FIELD, see README)"
+            f"{len(fetched)} appointments fetched and none has a CreatedBy: Tebra's GetAppointment response "
+            "changed; check scripts/probe_appointment.py"
         )
 
 
-def _sync(client, tables, rows: list[AppointmentAuthor]) -> tuple[int, int]:
+def _flush(client, tables, rows: list[AppointmentAuthor], result: dict) -> None:
     if not rows:
-        return 0, 0
+        return
     _check_authors(rows)
     load_staging(client, tables, rows)
-    return merge_current(client, tables), append_history(client, tables)
+    result["merged"] += merge_current(client, tables)
+    result["history_added"] += append_history(client, tables)
+    result["processed"] += len(rows)
+    result["fetch_errors"] += sum(r.fetch_error is not None for r in rows)
+    result["null_created_by"] += sum(r.fetch_error is None and r.created_by_user_id is None for r in rows)
+    rows.clear()
 
 
-def run(mode: str, start: datetime | None = None, end: datetime | None = None, *,
-        client=None, tables: Tables | None = None, fetch: Fetch | None = None, now: datetime | None = None) -> dict:
-    now = now or datetime.now(timezone.utc)
-    if fetch is None:
-        tebra = TebraClient()  # one WSDL load per run
-        fetch = lambda s, e: fetch_appointment_authors(s, e, call=tebra.get_modified)  # noqa: E731
+def run(*, client=None, tables: Tables | None = None, call: Callable[[str], AppointmentAuthor] | None = None,
+        clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
+        max_seconds: float | None = None, batch_size: int | None = None, min_interval: float | None = None,
+        limit: int | None = None) -> dict:
     s = Settings()
+    max_seconds = s.max_run_seconds if max_seconds is None else max_seconds
+    batch_size = batch_size or s.batch_size
+    min_interval = s.min_interval if min_interval is None else min_interval
     if client is None:
         from google.cloud import bigquery
 
@@ -60,54 +67,51 @@ def run(mode: str, start: datetime | None = None, end: datetime | None = None, *
     if private_staging:
         tables = Tables.from_settings(s).for_run(uuid.uuid4().hex[:12])
     try:
-        return _run(mode, start, end, client, tables, fetch, now)
+        return _run(client, tables, call, clock, sleep, max_seconds, batch_size, min_interval, limit, s)
     finally:
         if private_staging:
             drop_staging(client, tables)
 
 
-def _run(mode, start, end, client, tables, fetch: Fetch, now: datetime) -> dict:
-    if mode == "incremental":
-        watermark = get_watermark(client, tables)
-        if watermark is None:
-            raise SystemExit("appointment_authors is empty: run `backfill --start 2018-09-01` first")
-        if watermark > now + timedelta(hours=1):
-            logging.warning("watermark %s is in the future; capping incremental window at now", watermark)
-        windows = [(min(watermark, now) - OVERLAP, now)]
-    elif mode == "backfill":
-        if start is None:
-            raise SystemExit("backfill needs --start")
-        windows = list(_month_windows(start, end or now))
-    else:
-        raise SystemExit(f"unknown mode {mode!r}")
+def _run(client, tables, call, clock, sleep, max_seconds, batch_size, min_interval, limit, s) -> dict:
+    deadline = clock() + max_seconds
+    result = {"processed": 0, "merged": 0, "history_added": 0, "fetch_errors": 0, "null_created_by": 0,
+              "pending_before": count_pending(client, tables), "pending_after": None, "stopped_by": None}
+    # No point reading more IDs than the time budget allows Tebra calls for.
+    cap = limit or int(max_seconds / max(min_interval, 0.05)) + batch_size
+    pending = get_pending(client, tables, cap)
+    if not pending:
+        result.update(pending_after=0, stopped_by="no_pending")
+        return result
 
-    result = {"mode": mode, "window_start": windows[0][0].isoformat(), "window_end": windows[-1][1].isoformat(),
-              "fetched": 0, "merged": 0, "history_added": 0, "null_created_by": 0, "null_modified_by": 0}
-    for w_start, w_end in windows:
-        rows = fetch(w_start, w_end)
-        merged, added = _sync(client, tables, rows)
-        result["fetched"] += len(rows)
-        result["merged"] += merged
-        result["history_added"] += added
-        result["null_created_by"] += sum(r.created_by_user_id is None for r in rows)
-        result["null_modified_by"] += sum(r.last_modified_by_user_id is None for r in rows)
-        if mode == "backfill":
-            logging.info("backfill window %s→%s: %d rows", w_start.date(), w_end.date(), len(rows))
+    prod_ts = dict(pending)
+    call = call or TebraClient(s).fetch
+    buffer: list[AppointmentAuthor] = []
+    try:
+        for author in fetch_authors(prod_ts, call=call, deadline=deadline, min_interval=min_interval,
+                                    sleep=sleep, clock=clock):
+            buffer.append(replace(author, prod_last_modified=prod_ts[author.id]))
+            if len(buffer) >= batch_size:
+                _flush(client, tables, buffer, result)
+    finally:
+        # Save what was fetched even if Tebra failed midway (a flush error is chained to the original one).
+        try:
+            _flush(client, tables, buffer, result)
+        except Exception:
+            logging.exception("could not save partial batch")
+            raise
+    result["stopped_by"] = "done" if result["processed"] == len(pending) else "deadline"
+    result["pending_after"] = count_pending(client, tables)
     return result
-
-
-def _date(value: str) -> datetime:
-    return datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
 
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
     parser = argparse.ArgumentParser(prog="appt_authors")
-    parser.add_argument("mode", choices=["incremental", "backfill"])
-    parser.add_argument("--start", type=_date)
-    parser.add_argument("--end", type=_date)
+    parser.add_argument("--max-seconds", type=float, help="time budget for this run (default MAX_RUN_SECONDS)")
+    parser.add_argument("--limit", type=int, help="process at most N appointments")
     args = parser.parse_args(argv)
-    print(json.dumps(run(args.mode, args.start, args.end)))
+    print(json.dumps(run(max_seconds=args.max_seconds, limit=args.limit)))
 
 
 if __name__ == "__main__":
