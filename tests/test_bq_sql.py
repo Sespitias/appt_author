@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from appt_authors.bq import Tables, append_history, get_watermark, load_staging, merge_current
+from appt_authors.bq import Tables, append_history, count_pending, get_pending, load_staging, merge_current
 from appt_authors.config import Settings
 from appt_authors.models import AppointmentAuthor
 
@@ -20,13 +20,16 @@ pytestmark = [
 ]
 
 UTC = timezone.utc
-T1 = datetime(2026, 10, 18, 9, 0, tzinfo=UTC)
-T2 = datetime(2026, 10, 18, 10, 0, tzinfo=UTC)
 DDL = (Path(__file__).parents[1] / "sql" / "01_tables.sql").read_text()
 
 
-def _a(id_, modified, created_by="u1", modified_by="u2", status="Scheduled"):
-    return AppointmentAuthor(id_, created_by, modified_by, T1, modified, status)
+def T(h):
+    return datetime(2026, 10, 19, h, tzinfo=UTC)
+
+
+def _a(id_, prod_h, updated_h=None, created_by="c", modified_by="m", error=None):
+    return AppointmentAuthor(id_, created_by, modified_by, T(8), T(updated_h) if updated_h else None,
+                             False, False, prod_last_modified=T(prod_h), fetch_error=error)
 
 
 @pytest.fixture
@@ -35,20 +38,20 @@ def bq():
 
     s = replace(Settings(), bq_dataset="Telemind_Test_DB")
     client = bigquery.Client(project=s.bq_project, location=s.bq_location)
-    suffix = "_t" + uuid.uuid4().hex[:8]
-    tables = Tables.from_settings(s, suffix)
-    ddl = (DDL.replace("Telemind_BD", "Telemind_Test_DB")
-              .replace("appointment_authors_staging`", f"appointment_authors_staging{suffix}`")
-              .replace("appointment_authors`", f"appointment_authors{suffix}`")
-              .replace("appointment_author_history`", f"appointment_author_history{suffix}`"))
-    client.query(ddl).result()
+    sfx = "_t" + uuid.uuid4().hex[:8]
+    base = Tables.from_settings(s)
+    tables = Tables(prod=base.prod[:-1] + sfx + "`", staging=base.staging[:-1] + sfx + "`",
+                    current=base.current[:-1] + sfx + "`", history=base.history[:-1] + sfx + "`")
+    client.query(DDL.replace("Telemind_BD", "Telemind_Test_DB")
+                    .replace("appointment_authors`", f"appointment_authors{sfx}`")
+                    .replace("appointment_author_history`", f"appointment_author_history{sfx}`")).result()
+    client.query(f"""CREATE TABLE {tables.prod} AS SELECT * FROM UNNEST([
+        STRUCT('A' AS ID, TIMESTAMP '{T(2).isoformat()}' AS LastModifiedDate),
+        ('B', TIMESTAMP '{T(1).isoformat()}'), ('C', TIMESTAMP '{T(3).isoformat()}'),
+        ('D', TIMESTAMP '{T(1).isoformat()}')])""").result()
     yield client, tables
-    for t in (tables.staging, tables.current, tables.history):
+    for t in (tables.prod, tables.staging, tables.current, tables.history):
         client.delete_table(t.strip("`"), not_found_ok=True)
-
-
-def _rows(client, table):
-    return [dict(r) for r in client.query(f"SELECT * FROM {table} ORDER BY ID, LastModifiedDate").result()]
 
 
 def _sync(client, tables, rows):
@@ -57,41 +60,41 @@ def _sync(client, tables, rows):
     append_history(client, tables)
 
 
-def test_merge_inserts_new_ids(bq):
+def _one(client, sql):
+    return list(client.query(sql).result())[0]
+
+
+def test_pending_is_newest_first(bq):
     client, tables = bq
-    _sync(client, tables, [_a("1", T1), _a("2", T1)])
-    assert [r["ID"] for r in _rows(client, tables.current)] == ["1", "2"]
-    assert get_watermark(client, tables) == T1
+    assert [i for i, _ in get_pending(client, tables, 10)][:2] == ["C", "A"]
+    assert count_pending(client, tables) == 4
 
 
-def test_merge_does_not_regress_to_older_modification(bq):
+def test_processed_and_errored_rows_stop_being_pending(bq):
     client, tables = bq
-    _sync(client, tables, [_a("1", T2, modified_by="new")])
-    _sync(client, tables, [_a("1", T1, modified_by="old")])
-    (row,) = _rows(client, tables.current)
-    assert row["LastModifiedByUserID"] == "new"
-    assert row["LastModifiedDate"] == T2
-
-
-def test_merge_keeps_creator_when_source_null(bq):
-    client, tables = bq
-    _sync(client, tables, [_a("1", T1, created_by="creator")])
-    _sync(client, tables, [_a("1", T2, created_by=None)])
-    (row,) = _rows(client, tables.current)
-    assert row["CreatedByUserID"] == "creator"
-    assert row["LastModifiedDate"] == T2
+    _sync(client, tables, [_a("A", 2, 10), _a("B", 1, error="does not exist"), _a("C", 3, 11)])
+    assert [i for i, _ in get_pending(client, tables, 10)] == ["D"]
+    assert _one(client, f"SELECT COUNT(*) n FROM {tables.history}")["n"] == 2
 
 
 def test_history_is_idempotent(bq):
     client, tables = bq
-    batch = [_a("1", T1), _a("2", T1)]
+    batch = [_a("A", 2, 10), _a("C", 3, 11)]
     _sync(client, tables, batch)
     _sync(client, tables, batch)
-    assert len(_rows(client, tables.history)) == 2
+    assert _one(client, f"SELECT COUNT(*) n FROM {tables.history}")["n"] == 2
 
 
-def test_history_records_each_distinct_modification(bq):
+def test_merge_does_not_regress(bq):
     client, tables = bq
-    _sync(client, tables, [_a("1", T1, modified_by="a")])
-    _sync(client, tables, [_a("1", T2, modified_by="b")])
-    assert [r["LastModifiedByUserID"] for r in _rows(client, tables.history)] == ["a", "b"]
+    _sync(client, tables, [_a("A", 2, 10, modified_by="new")])
+    _sync(client, tables, [_a("A", 1, 9, modified_by="old")])
+    assert _one(client, f"SELECT LastModifiedByUserID m FROM {tables.current} WHERE ID='A'")["m"] == "new"
+
+
+def test_error_keeps_previous_authors(bq):
+    client, tables = bq
+    _sync(client, tables, [_a("A", 2, 10, modified_by="m1")])
+    _sync(client, tables, [_a("A", 3, created_by=None, modified_by=None, error="does not exist")])
+    row = _one(client, f"SELECT LastModifiedByUserID m, FetchError e FROM {tables.current} WHERE ID='A'")
+    assert row["m"] == "m1" and row["e"] == "does not exist"

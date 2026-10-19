@@ -4,21 +4,24 @@ CREATE TABLE IF NOT EXISTS `weekly-revenue-integration.Telemind_BD.appointment_a
   ID STRING NOT NULL,
   CreatedByUserID STRING,
   LastModifiedByUserID STRING,
-  CreatedDate TIMESTAMP,
-  LastModifiedDate TIMESTAMP,
-  ConfirmationStatus STRING,
+  CreatedAtUtc TIMESTAMP,
+  UpdatedAtUtc TIMESTAMP,
+  WasCreatedOnline BOOL,
+  IsDeleted BOOL,
+  ProdLastModifiedDate TIMESTAMP,
+  FetchError STRING,
   synced_at TIMESTAMP
 )
 CLUSTER BY ID
-OPTIONS (description = 'Creator and last modifier (Tebra user IDs) per appointment ID. Loaded by tebra-appt-authors.');
+OPTIONS (description = 'Tebra GetAppointment CreatedBy/UpdatedBy per appointment ID. LastModifiedByUserID is NULL when UpdatedBy=0 (not modified since creation). ProdLastModifiedDate = appointment_prod.LastModifiedDate this row answers for. Loaded by tebra-appt-authors.');
 
 CREATE TABLE IF NOT EXISTS `weekly-revenue-integration.Telemind_BD.appointment_author_history` (
   ID STRING NOT NULL,
-  LastModifiedDate TIMESTAMP NOT NULL,
+  UpdatedAtUtc TIMESTAMP NOT NULL,
   LastModifiedByUserID STRING,
-  ConfirmationStatus STRING,
+  ProdLastModifiedDate TIMESTAMP,
   captured_at TIMESTAMP
 )
-PARTITION BY DATE(LastModifiedDate)
+PARTITION BY DATE(UpdatedAtUtc)
 CLUSTER BY ID
-OPTIONS (description = 'One row per observed (ID, LastModifiedDate). History starts at job go-live.');
+OPTIONS (description = 'One row per observed Tebra modification (ID, UpdatedAtUtc). Only modifications seen by a job run are recorded.');
